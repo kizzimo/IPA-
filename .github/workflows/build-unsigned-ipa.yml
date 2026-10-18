@@ -1,0 +1,45 @@
+name: Build KIZZIMO unsigned iPhone IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build-iphone:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Print Xcode version
+        run: xcodebuild -version
+      - name: Compile for physical iPhone
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project KIZZIMOPowerLab.xcodeproj \
+            -scheme KIZZIMOPowerLab \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/KIZZIMO_build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/KIZZIMO_build/Build/Products/Release-iphoneos/KIZZIMOPowerLab.app" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qr "$GITHUB_WORKSPACE/KIZZIMO-Control-UNSIGNED.ipa" Payload
+          unzip -t "$GITHUB_WORKSPACE/KIZZIMO-Control-UNSIGNED.ipa"
+      - name: Save build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KIZZIMO-Control-UNSIGNED-IPA
+          path: KIZZIMO-Control-UNSIGNED.ipa
+          retention-days: 14
