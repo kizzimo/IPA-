@@ -4,8 +4,9 @@ import UIKit
 import QuartzCore
 import Metal
 import UniformTypeIdentifiers
+import Network
 
-// KIZZIMO iOS FULL CONTROL — NATIVE v2.0
+// KIZZIMO iOS FULL CONTROL — NATIVE v2.1
 // Supported public APIs only. All scheduling/power activity changes are APP-LOCAL.
 
 struct LabRecord: Codable, Identifiable {
@@ -161,7 +162,7 @@ struct ExportedReport: Codable {
     }
 
     func export() -> URL? {
-        let report = ExportedReport(title: "KIZZIMO iOS Native v2.0",
+        let report = ExportedReport(title: "KIZZIMO iOS Native v2.1",
                                     generated: Date(),
                                     iOS: UIDevice.current.systemVersion,
                                     model: UIDevice.current.model,
@@ -185,7 +186,7 @@ struct ExportedReport: Codable {
     private var generation = 0
     var onResult: ((String) -> Void)?
 
-    func start() {
+    func start(targetHz: Int = 0) {
         guard !running else { return }
         generation += 1
         let gen = generation
@@ -193,7 +194,8 @@ struct ExportedReport: Codable {
         running = true; summary = "Sampling for 6 seconds…"
         let dl = CADisplayLink(target: self, selector: #selector(tick(_:)))
         let peak = Float(UIScreen.main.maximumFramesPerSecond)
-        dl.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: peak, preferred: peak)
+        let desired = targetHz <= 0 ? peak : min(peak, Float(targetHz))
+        dl.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, peak), maximum: peak, preferred: desired)
         dl.add(to: .main, forMode: .common)
         link = dl
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
@@ -434,10 +436,128 @@ enum DraftOverride: Int, Codable { case disabled = 1, enabled = 0, remove = -1 }
     }
 }
 
+
+@MainActor final class SystemLab: ObservableObject {
+    @Published var networkStatus = "Detecting connection…"
+    @Published var interface = "Unknown"
+    @Published var constrained = false
+    @Published var expensive = false
+    @Published var ipv4 = false
+    @Published var ipv6 = false
+    @Published var dnsSupported = false
+    @Published var lastHTTPS = "Not tested"
+    @Published var probing = false
+    @Published var keepAwake = UIApplication.shared.isIdleTimerDisabled
+    @Published var memoryWarnings = 0
+
+    private let monitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "com.kizzimo.ios.network-observer")
+    private var observer: NSObjectProtocol?
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let link: String
+            if path.status != .satisfied {
+                link = "No usable network path"
+            } else if path.usesInterfaceType(.wifi) {
+                link = "Wi-Fi"
+            } else if path.usesInterfaceType(.cellular) {
+                link = "Cellular"
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                link = "Ethernet"
+            } else {
+                link = "Other / VPN / mixed"
+            }
+            let status = path.status == .satisfied ? "Satisfied" :
+                (path.status == .requiresConnection ? "Requires connection" : "Unsatisfied")
+            let exp = path.isExpensive
+            let con = path.isConstrained
+            let v4 = path.supportsIPv4
+            let v6 = path.supportsIPv6
+            let dns = path.supportsDNS
+            DispatchQueue.main.async { [weak self] in
+                self?.networkStatus = status
+                self?.interface = link
+                self?.expensive = exp
+                self?.constrained = con
+                self?.ipv4 = v4
+                self?.ipv6 = v6
+                self?.dnsSupported = dns
+            }
+        }
+        monitor.start(queue: monitorQueue)
+        observer = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.memoryWarnings += 1 }
+        }
+    }
+
+    var cpuCores: Int { ProcessInfo.processInfo.processorCount }
+    var activeCores: Int { ProcessInfo.processInfo.activeProcessorCount }
+    var physicalRAM: String {
+        String(format: "%.2f GiB", Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824)
+    }
+    var uptime: String {
+        let total = Int(ProcessInfo.processInfo.systemUptime)
+        return "\(total / 86_400)d \((total % 86_400) / 3_600)h \((total % 3_600) / 60)m"
+    }
+    var storageFree: String {
+        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
+              let n = attrs[.systemFreeSize] as? NSNumber else { return "Unavailable" }
+        return String(format: "%.2f GiB", Double(truncating: n) / 1_073_741_824)
+    }
+    var refreshStatus: String {
+        switch UIApplication.shared.backgroundRefreshStatus {
+        case .available: return "Available"
+        case .denied: return "Disabled"
+        case .restricted: return "Restricted"
+        @unknown default: return "Unknown"
+        }
+    }
+    func setKeepAwake(_ on: Bool) {
+        UIApplication.shared.isIdleTimerDisabled = on
+        keepAwake = UIApplication.shared.isIdleTimerDisabled
+    }
+
+    func snapshot() -> String {
+        "CPU: \(cpuCores) logical, \(activeCores) active; RAM: \(physicalRAM); " +
+        "free storage: \(storageFree); uptime: \(uptime); background refresh: \(refreshStatus); " +
+        "network: \(interface) / \(networkStatus), expensive=\(expensive), constrained=\(constrained); " +
+        "memory warnings to KIZZIMO: \(memoryWarnings); HTTPS samples: \(lastHTTPS)"
+    }
+
+    func measureHTTPS() async {
+        guard !probing else { return }
+        probing = true
+        lastHTTPS = "Testing 3 HTTPS requests…"
+        var samples: [String] = []
+        let url = URL(string: "https://www.apple.com/library/test/success.html")!
+        for i in 1...3 {
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+            request.httpMethod = "GET"
+            let start = ProcessInfo.processInfo.systemUptime
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                let ms = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                samples.append(String(format: "#%d %.1f ms (HTTP %d)", i, ms, code))
+            } catch {
+                samples.append("#\(i): \(error.localizedDescription)")
+            }
+        }
+        lastHTTPS = samples.joined(separator: " | ")
+        probing = false
+    }
+}
+
 struct ContentView: View {
     @StateObject private var engine = PowerEngine()
     @StateObject private var cadence = CadenceSampler()
     @StateObject private var daemons = DaemonDraft()
+    @StateObject private var system = SystemLab()
+    @State private var cadencePreference = 0
     @State private var showDaemonImporter = false
     @State private var touch: [Double] = []
     @State private var share: FileShare?
@@ -449,6 +569,7 @@ struct ContentView: View {
             powerTab.tabItem { Label("Power", systemImage: "bolt.fill") }
             cpuTab.tabItem { Label("CPU", systemImage: "cpu") }
             inputTab.tabItem { Label("Display / Touch", systemImage: "hand.tap") }
+            systemTab.tabItem { Label("System", systemImage: "server.rack") }
             daemonTab.tabItem { Label("Daemons", systemImage: "gearshape.2") }
             historyTab.tabItem { Label("Reports", systemImage: "chart.bar.xaxis") }
         }
@@ -504,6 +625,56 @@ struct ContentView: View {
         }
     }
 
+
+    private var systemTab: some View {
+        NavigationStack {
+            Form {
+                Section("SYSTEM TELEMETRY — READ ONLY") {
+                    LabeledContent("CPU cores", value: "\(system.cpuCores) logical / \(system.activeCores) active")
+                    LabeledContent("Physical RAM", value: system.physicalRAM)
+                    LabeledContent("Free storage", value: system.storageFree)
+                    LabeledContent("Uptime", value: system.uptime)
+                    LabeledContent("Background App Refresh", value: system.refreshStatus)
+                    LabeledContent("KIZZIMO memory warnings", value: "\(system.memoryWarnings)")
+                    Text("These readings do not expose CPU frequency or system-wide free RAM.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("LIVE NETWORK PATH") {
+                    LabeledContent("Path", value: system.networkStatus)
+                    LabeledContent("Interface", value: system.interface)
+                    LabeledContent("Expensive / metered", value: system.expensive ? "Yes" : "No")
+                    LabeledContent("Low-data constraint", value: system.constrained ? "Yes" : "No")
+                    LabeledContent("IPv4 / IPv6", value: "\(system.ipv4 ? "Yes" : "No") / \(system.ipv6 ? "Yes" : "No")")
+                    LabeledContent("DNS supported", value: system.dnsSupported ? "Yes" : "No")
+                }
+                Section("ON-DEMAND HTTPS TIMING") {
+                    Button(system.probing ? "Measuring…" : "Measure 3 HTTPS requests") {
+                        Task {
+                            await system.measureHTTPS()
+                            engine.add("HTTPS timing", system.lastHTTPS)
+                        }
+                    }.disabled(system.probing)
+                    Text(system.lastHTTPS).font(.footnote).textSelection(.enabled)
+                    Text("Includes network setup, server response and transport overhead. NOT ICMP ping or game RTT.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("ACTUAL APP CONTROL") {
+                    Toggle("Keep screen awake while KIZZIMO is open",
+                           isOn: Binding(get: { system.keepAwake }, set: { system.setKeepAwake($0) }))
+                    Text("Prevents auto-lock while the app is being used. Does not modify global auto-lock policy.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("SAVE DIAGNOSTICS") {
+                    Button("Save full system snapshot") {
+                        engine.add("System telemetry", system.snapshot())
+                    }
+                    Text("Snapshots become available under Reports for JSON export.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.navigationTitle("System / Network")
+        }
+    }
+
     private var cpuTab: some View {
         NavigationStack {
             Form {
@@ -530,9 +701,17 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("DISPLAY-LINK CADENCE") {
+                    Picker("Callback preference", selection: $cadencePreference) {
+                        Text("Max").tag(0)
+                        Text("30").tag(30)
+                        Text("60").tag(60)
+                        Text("120").tag(120)
+                    }.pickerStyle(.segmented)
+                    Text("Best-effort cadence preference for KIZZIMO only. iOS may choose another rate.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Button(cadence.running ? "Running…" : "Measure display cadence") {
                         cadence.onResult = { engine.add("DisplayLink", $0) }
-                        cadence.start()
+                        cadence.start(targetHz: cadencePreference)
                     }.disabled(cadence.running)
                     Text(cadence.summary).font(.footnote).textSelection(.enabled)
                 }
