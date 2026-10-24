@@ -14,6 +14,11 @@ jobs:
         uses: actions/checkout@v4
       - name: Print Xcode version
         run: xcodebuild -version
+      - name: Validate Windows bridge implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 DaemonCompanion.py --self-test
       - name: Compile for physical iPhone
         shell: bash
         run: |
@@ -37,6 +42,18 @@ jobs:
           cd "$RUNNER_TEMP/ipa"
           zip -qr "$GITHUB_WORKSPACE/KIZZIMO-Control-UNSIGNED.ipa" Payload
           unzip -t "$GITHUB_WORKSPACE/KIZZIMO-Control-UNSIGNED.ipa"
+      - name: Package Windows companion
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -j -q KIZZIMO-DaemonCompanion-Windows.zip DaemonCompanion.py START_DAEMON_COMPANION.bat README.md
+          unzip -t KIZZIMO-DaemonCompanion-Windows.zip
+      - name: Save Windows companion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KIZZIMO-DaemonCompanion-Windows
+          path: KIZZIMO-DaemonCompanion-Windows.zip
+          retention-days: 14
       - name: Save build artifact
         uses: actions/upload-artifact@v4
         with:
