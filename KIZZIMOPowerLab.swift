@@ -349,7 +349,37 @@ enum DraftOverride: Int, Codable { case disabled = 1, enabled = 0, remove = -1 }
     @Published var query = ""
     @Published var customID = ""
     @Published var message = "Exporting a draft cannot apply it to protected iOS paths."
-    @Published var edits: [String: DraftOverride] = [:]
+    @Published var edits: [String: DraftOverride] = [:] {
+        didSet {
+            if let data = try? JSONEncoder().encode(edits) { UserDefaults.standard.set(data, forKey: "daemonbridge.edits") }
+        }
+    }
+
+    init() {
+        if let saved = UserDefaults.standard.data(forKey: "daemonbridge.edits"),
+           let decoded = try? JSONDecoder().decode([String: DraftOverride].self, from: saved) {
+            edits = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: "daemonbridge.source") {
+            var format = PropertyListSerialization.PropertyListFormat.xml
+            if let root = try? PropertyListSerialization.propertyList(from: data, options: [], format: &format) as? [String: Any] {
+                sourceRoot = root
+                sourceName = UserDefaults.standard.string(forKey: "daemonbridge.sourceName") ?? "Imported"
+            }
+        }
+    }
+    static func isProtected(_ label: String) -> Bool {
+        let exact: Set<String> = [
+            "com.apple.thermalmonitord", "com.apple.locationd", "com.apple.healthd", "com.apple.passd",
+            "com.apple.mobile.softwareupdated", "com.apple.OTATaskingAgent",
+            "com.apple.softwareupdateservicesd", "com.apple.mobile.NRDUpdated",
+            "com.apple.diagnosticd", "com.apple.ReportCrash", "com.apple.logd",
+            "com.apple.syslogd", "com.apple.ScreenTimeAgent", "com.apple.homed",
+            "com.apple.familycircled", "com.apple.racoon"
+        ]
+        return exact.contains(label) || label.hasPrefix("com.apple.logd.") ||
+               label.hasPrefix("com.apple.ReportCrash.") || label.hasPrefix("com.apple.Dump")
+    }
     @Published var customTargets: [DaemonTarget] = []
     private var sourceRoot: [String: Any] = [:]
 
@@ -365,6 +395,8 @@ enum DraftOverride: Int, Codable { case disabled = 1, enabled = 0, remove = -1 }
     }
     func reset() {
         sourceName = "Blank draft"; sourceRoot = [:]; edits = [:]
+        UserDefaults.standard.removeObject(forKey: "daemonbridge.source")
+        UserDefaults.standard.removeObject(forKey: "daemonbridge.sourceName")
         message = "Empty draft. Add staged entries to export."
     }
     func addCustom() {
@@ -386,6 +418,8 @@ enum DraftOverride: Int, Codable { case disabled = 1, enabled = 0, remove = -1 }
         sourceRoot = root
         sourceName = filename
         edits = [:]
+        UserDefaults.standard.set(data, forKey: "daemonbridge.source")
+        UserDefaults.standard.set(filename, forKey: "daemonbridge.sourceName")
         message = "Imported \(root.count) source keys. Original file was not modified."
     }
     func displayState(_ label: String) -> String {
@@ -400,8 +434,8 @@ enum DraftOverride: Int, Codable { case disabled = 1, enabled = 0, remove = -1 }
         return sourceRoot[label] == nil ? "SOURCE: ABSENT" : "SOURCE: NON-BOOLEAN"
     }
     func stage(_ choice: DraftOverride, label: String) {
-        if choice == .disabled && label == "com.apple.thermalmonitord" {
-            message = "Blocked disabling thermalmonitord"; return
+        if choice == .disabled && Self.isProtected(label) {
+            message = "Refused to stage disabling protected daemon: \(label)"; return
         }
         edits[label] = choice
         message = "Staged \(label). iOS has not been modified."
@@ -556,6 +590,8 @@ struct ContentView: View {
     @StateObject private var engine = PowerEngine()
     @StateObject private var cadence = CadenceSampler()
     @StateObject private var daemons = DaemonDraft()
+    @StateObject private var daemonBridge = DaemonBridgeV3()
+    @AppStorage("daemonbridge.preset") private var selectedPreset = "Custom"
     @StateObject private var system = SystemLab()
     @State private var cadencePreference = 0
     @State private var showDaemonImporter = false
@@ -742,36 +778,77 @@ struct ContentView: View {
         }
     }
 
+    private func changePreset(_ new: String) {
+        guard let preset = DaemonPresetV3(rawValue: new) else { return }
+        if selectedPreset == "Custom" { DaemonPresetStorage.saveCustom(daemons.edits) }
+        selectedPreset = new
+        switch preset {
+        case .custom: daemons.edits = DaemonPresetStorage.custom()
+        case .restore: daemons.edits = [:]
+        default:
+            daemons.edits = Dictionary(uniqueKeysWithValues: preset.labels.map { ($0, DraftOverride.disabled) })
+        }
+        daemons.message = "\(new): \(daemons.edits.count) staged changes only; iOS is unchanged."
+    }
+
+    private func stageDaemon(_ choice: DraftOverride, label: String) {
+        daemons.stage(choice, label: label)
+        selectedPreset = "Custom"
+        DaemonPresetStorage.saveCustom(daemons.edits)
+    }
+
     private var daemonTab: some View {
         NavigationStack {
             List {
-                Section("OFFLINE CONFIGURATION — NOT LIVE DAEMONS") {
-                    Text("An imported plist is edited in memory and exported separately. No system service is changed or stopped by this app.")
+                Section("DAEMON PRESETS — STAGED CONFIGURATION") {
+                    Picker("Preset", selection: Binding(get: { selectedPreset }, set: { changePreset($0) })) {
+                        ForEach(DaemonPresetV3.allCases) { preset in
+                            Text(preset.rawValue).tag(preset.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Text("Balanced = Tips. Performance adds Game Center, AirPrint and usage tracking. Extreme also stages Spotlight, voice, hotspot and other optional services; applying these changes externally may remove important features.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Source: \(daemons.sourceName) · staged: \(daemons.edits.count)")
-                        .font(.footnote)
+                    Text("Restore Draft clears your edits against the imported baseline; it is not a device restore.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Source: \(daemons.sourceName) · staged: \(daemons.edits.count)").font(.footnote)
                     HStack {
                         Button("Import plist") { showDaemonImporter = true }
                         Button("New blank") { daemons.reset() }
                     }
-                    Button("Export staged XML plist") {
+                    Button("Export XML plist") {
                         do { share = FileShare(url: try daemons.exportXML()) }
                         catch { daemons.message = "Export failed: \(error.localizedDescription)" }
                     }
-                    Button("Export staged JSON audit") {
+                    Button("Export JSON audit") {
                         do { share = FileShare(url: try daemons.exportJSON()) }
                         catch { daemons.message = "Export failed: \(error.localizedDescription)" }
                     }
-                    Button("Undo all staged edits", role: .destructive) { daemons.edits = [:]; daemons.message = "Draft cleared" }
                     Text(daemons.message).font(.caption).foregroundStyle(.secondary)
                 }
-                Section("ADD A CUSTOM LAUNCHD IDENTIFIER") {
+                Section("COMPANION CONNECTION — YOUR HOME NETWORK") {
+                    TextField("Windows IP e.g. 192.168.1.25", text: $daemonBridge.host)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .keyboardType(.numbersAndPunctuation)
+                    SecureField("Pairing token from Windows", text: $daemonBridge.token)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    HStack {
+                        Button("Test") { Task { await daemonBridge.check() } }
+                        Button("Send draft") { Task { await daemonBridge.send(daemons, preset: selectedPreset) } }
+                            .disabled(daemonBridge.busy)
+                    }
+                    .buttonStyle(.bordered)
+                    Text(daemonBridge.status).font(.caption).textSelection(.enabled)
+                    Text("Sending saves an XML configuration and audit on Windows. No iOS daemon is disabled, and no restore is run. LAN transfer is unencrypted: use only on a trusted private network.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("CUSTOM LAUNCHD IDENTIFIER") {
                     TextField("com.apple.exampled", text: $daemons.customID)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    Button("Add to catalog") { daemons.addCustom() }
+                    Button("Add identifier") { daemons.addCustom() }
                 }
-                Section("DAEMON IDENTIFIERS — STAGED OVERRIDES") {
-                    TextField("Search identifier or group", text: $daemons.query)
+                Section("DAEMON OVERRIDES — DRAFT ONLY") {
+                    TextField("Search identifier / group", text: $daemons.query)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     ForEach(daemons.filtered, id: \.label) { item in
                         VStack(alignment: .leading, spacing: 5) {
@@ -780,18 +857,17 @@ struct ContentView: View {
                             Text("\(item.group) · \(item.risk) · \(daemons.displayState(item.label))")
                                 .font(.caption2).foregroundStyle(.secondary)
                             HStack(spacing: 12) {
-                                Button("Disable") { daemons.stage(.disabled, label: item.label) }
-                                    .disabled(item.risk == "CRITICAL")
-                                Button("Enable") { daemons.stage(.enabled, label: item.label) }
-                                Button("Remove key") { daemons.stage(.remove, label: item.label) }
+                                Button("Disable") { stageDaemon(.disabled, label: item.label) }
+                                    .disabled(DaemonDraft.isProtected(item.label))
+                                Button("Enable") { stageDaemon(.enabled, label: item.label) }
+                                Button("Remove key") { stageDaemon(.remove, label: item.label) }
                             }
                             .font(.caption)
                             .buttonStyle(.bordered)
                         }.padding(.vertical, 4)
                     }
                 }
-            }
-            .navigationTitle("Daemon Draft Editor")
+            }.navigationTitle("Daemon Control v3")
         }
     }
 
