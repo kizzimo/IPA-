@@ -1,0 +1,32 @@
+name: PulseLab
+options:
+  bundleIdPrefix: org.pulselab
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    GENERATE_INFOPLIST_FILE: NO
+targets:
+  PulseLab:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: PulseLab
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.pulselab.foreground
+        INFOPLIST_FILE: PulseLab/Info.plist
+        CODE_SIGN_STYLE: Automatic
+schemes:
+  PulseLab:
+    build:
+      targets:
+        PulseLab: all
+    run:
+      config: Debug
+    archive:
+      config: Release
