@@ -1,0 +1,46 @@
+name: Build PulseLab unsigned IPA
+on:
+  push:
+    branches:
+      - pulselab-foreground
+    paths:
+      - "PulseLab/**"
+      - ".github/workflows/pulselab-unsigned-ipa.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+      - name: Generate iOS project
+        working-directory: PulseLab
+        run: xcodegen generate --spec project.yml
+      - name: Compile device app without signing
+        working-directory: PulseLab
+        run: |
+          xcodebuild -project PulseLab.xcodeproj \
+            -scheme PulseLab -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath output \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        working-directory: PulseLab
+        run: |
+          set -euo pipefail
+          mkdir -p out/Payload
+          cp -R output/Build/Products/Release-iphoneos/PulseLab.app out/Payload/PulseLab.app
+          (cd out && zip -qr PulseLab-unsigned.ipa Payload)
+          unzip -t out/PulseLab-unsigned.ipa | tail -1
+          test -s out/PulseLab-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PulseLab-unsigned-IPA
+          path: PulseLab/out/PulseLab-unsigned.ipa
+          if-no-files-found: error
